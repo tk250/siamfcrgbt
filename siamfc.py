@@ -269,9 +269,6 @@ class TrackerSiamFC(Tracker):
 
             # calculate loss
             labels = self._create_labels(responses.size())
-            #print(responses)
-            #print('target')
-            #print(labels)
             loss = self.criterion(responses, labels)
             
             if backward:
@@ -358,6 +355,7 @@ class TrackerSiamFC(Tracker):
         # repeat to size
         labels = labels.reshape((1, 1, h, w))
         labels = np.tile(labels, (n, c, 1, 1))
+
 
         # convert to tensors
         self.labels = torch.from_numpy(labels).to(self.device).float()
