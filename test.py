@@ -3,14 +3,15 @@ from __future__ import absolute_import
 import os
 from got10k.experiments import *
 
-from siamfc import TrackerSiamFC
+from siamfc_dropout import TrackerSiamFC
 
 
 if __name__ == '__main__':
-    net_path = 'pretrained/siamfc_alexnet_e10.pth'
-    tracker = TrackerSiamFC(net_path=net_path)
+    net_path1 = 'pretrained/siamfc_alexnet_RGB_Dropout_e50.pth'
+    net_path2 = 'pretrained/siamfc_alexnet_thermal_Dropout_e50.pth'
+    tracker = TrackerSiamFC(net_path1=net_path1, net_path2=net_path2)
 
-    root_dir = os.path.expanduser('~/data/GOT-10k/train_i')
-    e = ExperimentOTB(root_dir, version=2019)
+    root_dir = os.path.expanduser('~/RGB-t-Val')
+    e = ExperimentOTB(root_dir, version='test_dropout')
     e.run(tracker)
     e.report([tracker.name])

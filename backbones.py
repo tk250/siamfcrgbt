@@ -106,48 +106,77 @@ class AlexNetV3(_AlexNet):
             nn.Conv2d(768, 512, 3, 1),
             _BatchNorm2d(512))
 
-class SiameseNet(nn.Module):
+class SiameseNetRGB(nn.Module):
     
-    def forward(self, x1, x2):
-        x1 = self.conv1_v(x1)
-        x2 = self.conv1_i(x2)
-        x1 = self.conv2_v(x1)
-        x2 = self.conv2_i(x2)
-        x = torch.cat((x1, x2), 1)
-        x = self.conv3(x)
-        x = self.conv4(x)
+    def forward(self, x1):
+        x1 = self.conv1(x1)
+        x1 = self.conv2(x1)
+        x1 = self.conv3(x1)
+        x = self.conv4(x1)
         x = self.conv5(x)
         return x
 
     def __init__(self):
-        super(SiameseNet, self).__init__()
-        self.conv1_v = nn.Sequential(
+        super(SiameseNetRGB, self).__init__()
+        self.conv1 = nn.Sequential(
             nn.Conv2d(3, 96, 11, 2),
             _BatchNorm2d(96),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
             nn.MaxPool2d(3, 2))
-        self.conv1_i = nn.Sequential(
-            nn.Conv2d(3, 96, 11, 2),
-            _BatchNorm2d(96),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(3, 2))
-        self.conv2_v = nn.Sequential(
+        self.conv2 = nn.Sequential(
             nn.Conv2d(96, 256, 5, 1, groups=2),
             _BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(3, 2))
-        self.conv2_i = nn.Sequential(
-            nn.Conv2d(96, 256, 5, 1, groups=2),
-            _BatchNorm2d(256),
-            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
             nn.MaxPool2d(3, 2))
         self.conv3 = nn.Sequential(
-            nn.Conv2d(512, 384, 3, 1),
+            nn.Conv2d(256, 384, 3, 1),
             _BatchNorm2d(384),
-            nn.ReLU(inplace=True))
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1))
         self.conv4 = nn.Sequential(
             nn.Conv2d(384, 384, 3, 1, groups=2),
             _BatchNorm2d(384),
-            nn.ReLU(inplace=True))
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1))
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(384, 256, 3, 1, groups=2))
+
+
+class SiameseNetThermal(nn.Module):
+    
+    def forward(self, x2):
+        x2 = self.conv1(x2)
+        x2 = self.conv2(x2)
+        x2 = self.conv3(x2)
+        x = self.conv4(x2)
+        x = self.conv5(x)
+        return x
+
+    def __init__(self):
+        super(SiameseNetThermal, self).__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 96, 11, 2),
+            _BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
+            nn.MaxPool2d(3, 2))
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(96, 256, 5, 1, groups=2),
+            _BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
+            nn.MaxPool2d(3, 2))
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(256, 384, 3, 1),
+            _BatchNorm2d(384),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1))
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(384, 384, 3, 1, groups=2),
+            _BatchNorm2d(384),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1))
         self.conv5 = nn.Sequential(
             nn.Conv2d(384, 256, 3, 1, groups=2))
