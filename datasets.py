@@ -38,7 +38,7 @@ class Pair(Dataset):
             cv2.imread(img_files[0], cv2.IMREAD_COLOR),
             anno, vis_ratios)
         val_i_indices = self._filter(
-            cv2.imread(infrared_files[0], cv2.IMREAD_COLOR),
+            cv2.imread(infrared_files[0], cv2.IMREAD_GRAYSCALE),
             anno, vis_ratios)
         if len(val_rgb_indices) < 2:
             index = np.random.choice(len(self))
@@ -57,10 +57,10 @@ class Pair(Dataset):
 
         rand_z_i, rand_x_i = self._sample_pair(val_i_indices)
 
-        z_i = cv2.imread(img_files[rand_z_i], cv2.IMREAD_COLOR)
-        x_i = cv2.imread(img_files[rand_x_i], cv2.IMREAD_COLOR)
-        z_i = cv2.cvtColor(z_i, cv2.COLOR_BGR2RGB)
-        x_i = cv2.cvtColor(x_i, cv2.COLOR_BGR2RGB)
+        z_i = cv2.imread(img_files[rand_z_i], cv2.IMREAD_GRAYSCALE)
+        x_i = cv2.imread(img_files[rand_x_i], cv2.IMREAD_GRAYSCALE)
+        #z_i = cv2.cvtColor(z_i, cv2.COLOR_BGR2GRAY)
+        #x_i = cv2.cvtColor(x_i, cv2.COLOR_BGR2GRAY)
         
         box_z_i = anno[rand_z_i]
         box_x_i = anno[rand_x_i]

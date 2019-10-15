@@ -15,11 +15,12 @@ from torch.utils.data import DataLoader
 from got10k.trackers import Tracker
 
 import ops
-from backbones import AlexNetV1, SiameseNetRGB
+from backbones import AlexNetV1, SiameseNetRGB, SiameseNetThermal
 from heads import SiamFC
 from losses import BalancedLoss
 from datasets import Pair
 from transforms import SiamFCTransforms
+from got10k.utils.metrics import rect_iou
 
 
 __all__ = ['TrackerSiamFC']
@@ -32,15 +33,15 @@ class Net(nn.Module):
         self.backbone = backbone
         self.head = head
     
-    def forward(self, z1, x1):
-        z = self.backbone(z1)
-        x = self.backbone(x1)
+    def forward(self, z1, x1, z2, x2):
+        z = self.backbone(z1, z2)
+        x = self.backbone(x1, x2)
         return self.head(z, x)
 
 
 class TrackerSiamFC(Tracker):
 
-    def __init__(self, net_path=None, **kwargs):
+    def __init__(self, net_path1=None, net_path2=None,**kwargs):
         super(TrackerSiamFC, self).__init__('SiamFC', True)
         self.cfg = self.parse_args(**kwargs)
 
@@ -49,23 +50,37 @@ class TrackerSiamFC(Tracker):
         self.device = torch.device('cuda:0' if self.cuda else 'cpu')
 
         # setup model
-        self.net = Net(
+        self.net1 = Net(
             backbone=SiameseNetRGB(),
             head=SiamFC(self.cfg.out_scale))
-        ops.init_weights(self.net)
+        self.net2 = Net(
+            backbone=SiameseNetThermal(),
+            head=SiamFC(self.cfg.out_scale))
+        ops.init_weights(self.net1)
         
         # load checkpoint if provided
-        if net_path is not None:
-            self.net.load_state_dict(torch.load(
-                net_path, map_location=lambda storage, loc: storage))
-        self.net = self.net.to(self.device)
+        if net_path1 is not None:
+            self.net1.load_state_dict(torch.load(
+                net_path1, map_location=lambda storage, loc: storage))
+        self.net1 = self.net1.to(self.device)
+
+        if net_path2 is not None:
+            self.net2.load_state_dict(torch.load(
+                net_path2, map_location=lambda storage, loc: storage))
+        self.net2 = self.net2.to(self.device)
 
         # setup criterion
         self.criterion = BalancedLoss()
 
         # setup optimizer
-        self.optimizer = optim.SGD(
-            self.net.parameters(),
+        self.optimizer1 = optim.SGD(
+            self.net1.parameters(),
+            lr=self.cfg.initial_lr,
+            weight_decay=self.cfg.weight_decay,
+            momentum=self.cfg.momentum)
+
+        self.optimizer2 = optim.SGD(
+            self.net2.parameters(),
             lr=self.cfg.initial_lr,
             weight_decay=self.cfg.weight_decay,
             momentum=self.cfg.momentum)
@@ -74,7 +89,7 @@ class TrackerSiamFC(Tracker):
         gamma = np.power(
             self.cfg.ultimate_lr / self.cfg.initial_lr,
             1.0 / self.cfg.epoch_num)
-        self.lr_scheduler = ExponentialLR(self.optimizer, gamma)
+        self.lr_scheduler = ExponentialLR(self.optimizer1, gamma)
 
     def parse_args(self, **kwargs):
         # default parameters
@@ -112,7 +127,8 @@ class TrackerSiamFC(Tracker):
     @torch.no_grad()
     def init(self, visible_img, infrared_img, box):
         # set to evaluation mode
-        self.net.eval()
+        self.net1.eval()
+        self.net2.eval()
 
         # convert box to 0-indexed and center based [y, x, h, w]
         box = np.array([
@@ -145,6 +161,7 @@ class TrackerSiamFC(Tracker):
             visible_img, self.center, self.z_sz,
             out_size=self.cfg.exemplar_sz,
             border_value=self.avg_color)
+
         # exemplar infrared image
         self.avg_color = np.mean(infrared_img, axis=(0, 1))
         z2 = ops.crop_and_resize(
@@ -152,24 +169,29 @@ class TrackerSiamFC(Tracker):
             out_size=self.cfg.exemplar_sz,
             border_value=self.avg_color)
 
-
         # exemplar features
         z1 = torch.from_numpy(z1).to(
             self.device).permute(2, 0, 1).unsqueeze(0).float()
         z2 = torch.from_numpy(z2).unsqueeze(2).to(
             self.device).permute(2, 0, 1).unsqueeze(0).float()
-        self.kernel = self.net.backbone(z1)
+        self.kernel = self.net1.backbone(z1)
     
     @torch.no_grad()
-    def update(self, visible_img, infrared_img):
+    def update(self, visible_img, infrared_img, validation=False, f=0):
         # set to evaluation mode
-        self.net.eval()
+        self.net1.eval()
+        self.net2.eval()
+
+        # make dropouts work if we want to calculate uncertainity
+        if validation == True:
+            self.net1.apply(dropout)
+            self.net2.apply(dropout)
 
         # visible search images
         x1 = [ops.crop_and_resize(
             visible_img, self.center, self.x_sz * f,
             out_size=self.cfg.instance_sz,
-            border_value=self.avg_color) for f in self.scale_factors]
+            border_value=self.avg_color, f=f) for f in self.scale_factors]
         x1 = np.stack(x1, axis=0)
         x1 = torch.from_numpy(x1).to(
             self.device).permute(0, 3, 1, 2).float()
@@ -184,56 +206,21 @@ class TrackerSiamFC(Tracker):
             self.device).permute(0, 3, 1, 2).float()
         
         # responses
-        x = self.net.backbone(x1)
-        responses = self.net.head(self.kernel, x)
-        responses = responses.squeeze(1).cpu().numpy()
+        response_RGB = self.net1.backbone(x1)
+        response_thermal = self.net2.backbone(x2)
+        RGB_box = self._get_box(response_RGB)
+        thermal_box = self._get_box(response_thermal)
 
-        # upsample responses and penalize scale changes
-        responses = np.stack([cv2.resize(
-            u, (self.upscale_sz, self.upscale_sz),
-            interpolation=cv2.INTER_CUBIC)
-            for u in responses])
-        responses[:self.cfg.scale_num // 2] *= self.cfg.scale_penalty
-        responses[self.cfg.scale_num // 2 + 1:] *= self.cfg.scale_penalty
-
-        # peak scale
-        scale_id = np.argmax(np.amax(responses, axis=(1, 2)))
-
-        # peak location
-        response = responses[scale_id]
-        response -= response.min()
-        response /= response.sum() + 1e-16
-        response = (1 - self.cfg.window_influence) * response + \
-            self.cfg.window_influence * self.hann_window
-        loc = np.unravel_index(response.argmax(), response.shape)
-
-        # locate target center
-        disp_in_response = np.array(loc) - (self.upscale_sz - 1) / 2
-        disp_in_instance = disp_in_response * \
-            self.cfg.total_stride / self.cfg.response_up
-        disp_in_image = disp_in_instance * self.x_sz * \
-            self.scale_factors[scale_id] / self.cfg.instance_sz
-        self.center += disp_in_image
-
-        # update target size
-        scale =  (1 - self.cfg.scale_lr) * 1.0 + \
-            self.cfg.scale_lr * self.scale_factors[scale_id]
-        self.target_sz *= scale
-        self.z_sz *= scale
-        self.x_sz *= scale
-
-        # return 1-indexed and left-top based bounding box
-        box = np.array([
-            self.center[1] + 1 - (self.target_sz[1] - 1) / 2,
-            self.center[0] + 1 - (self.target_sz[0] - 1) / 2,
-            self.target_sz[1], self.target_sz[0]])
-
-        return box
+        return [RGB_box, thermal_box]
     
     def track(self, visible_files, infrared_files, box, visualize=False):
         frame_num = len(visible_files)
         boxes = np.zeros((frame_num, 4))
         boxes[0] = box
+        RGB_boxes = np.zeros((frame_num, 4))
+        RGB_boxes[0] = box
+        thermal_boxes = np.zeros((frame_num, 4))
+        thermal_boxes[0] = box
         times = np.zeros(frame_num)
 
         for f, visible_file in enumerate(visible_files):
@@ -244,7 +231,18 @@ class TrackerSiamFC(Tracker):
             if f == 0:
                 self.init(visible_img, infrared_img, box)
             else:
-                boxes[f, :] = self.update(visible_img, infrared_img)
+                res_boxes = self.update(visible_img, infrared_img, f)
+                RGB_intersection = 0
+                thermal_intersection = 0
+                for c in range(30):
+                    dropout_boxes = self.update(visible_img, infrared_img, validation=True)
+                    RGB_intersection += rect_iou(dropout_boxes[0], res_boxes[0])
+                    thermal_intersection += rect_iou(dropout_boxes[1], res_boxes[1])
+                if RGB_intersection < thermal_intersection:
+                    boxes[f, :] = res_boxes[0]
+                else:
+                    boxes[f, :] = res_boxes[1]
+                    
             times[f] = time.time() - begin
 
             if visualize:
@@ -265,7 +263,7 @@ class TrackerSiamFC(Tracker):
 
         with torch.set_grad_enabled(backward):
             # inference
-            responses = self.net(z1, x1)
+            responses = self.net(z1, x1, z2, x2)
 
             # calculate loss
             labels = self._create_labels(responses.size())
@@ -324,8 +322,54 @@ class TrackerSiamFC(Tracker):
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
             net_path = os.path.join(
-                save_dir, 'siamfc_alexnet_RGB_Dropout_e%d.pth' % (epoch + 1))
+                save_dir, 'siamfc_alexnet_thermal_e%d.pth' % (epoch + 1))
             torch.save(self.net.state_dict(), net_path)
+
+    def _get_box(self, x):
+        responses = self.net1.head(self.kernel, x)
+        responses = responses.squeeze(1).cpu().numpy()
+
+        # upsample responses and penalize scale changes
+        responses = np.stack([cv2.resize(
+            u, (self.upscale_sz, self.upscale_sz),
+            interpolation=cv2.INTER_CUBIC)
+            for u in responses])
+        responses[:self.cfg.scale_num // 2] *= self.cfg.scale_penalty
+        responses[self.cfg.scale_num // 2 + 1:] *= self.cfg.scale_penalty
+
+        # peak scale
+        scale_id = np.argmax(np.amax(responses, axis=(1, 2)))
+
+        # peak location
+        response = responses[scale_id]
+        response -= response.min()
+        response /= response.sum() + 1e-16
+        response = (1 - self.cfg.window_influence) * response + \
+            self.cfg.window_influence * self.hann_window
+        loc = np.unravel_index(response.argmax(), response.shape)
+
+        # locate target center
+        disp_in_response = np.array(loc) - (self.upscale_sz - 1) / 2
+        disp_in_instance = disp_in_response * \
+            self.cfg.total_stride / self.cfg.response_up
+        disp_in_image = disp_in_instance * self.x_sz * \
+            self.scale_factors[scale_id] / self.cfg.instance_sz
+        self.center += disp_in_image
+
+        # update target size
+        scale =  (1 - self.cfg.scale_lr) * 1.0 + \
+            self.cfg.scale_lr * self.scale_factors[scale_id]
+        self.target_sz *= scale
+        self.z_sz *= scale
+        self.x_sz *= scale
+
+        # return 1-indexed and left-top based bounding box
+        box = np.array([
+            self.center[1] + 1 - (self.target_sz[1] - 1) / 2,
+            self.center[0] + 1 - (self.target_sz[0] - 1) / 2,
+            self.target_sz[1], self.target_sz[0]])
+
+        return box
     
     def _create_labels(self, size):
         # skip if same sized labels already created
@@ -361,3 +405,9 @@ class TrackerSiamFC(Tracker):
         self.labels = torch.from_numpy(labels).to(self.device).float()
         
         return self.labels
+
+
+def dropout(module):
+    if type(module) == nn.Dropout:
+        print('Set module {} to train mode.'.format(m))
+        m.train(True)
