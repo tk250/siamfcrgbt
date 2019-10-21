@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from got10k.trackers import Tracker
 
 import ops
-from backbones import AlexNetV1, SiameseNetRGB
+from backbones import SSMA, Dense
 from heads import SiamFC
 from losses import BalancedLoss
 from datasets import Pair
@@ -31,17 +31,17 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.backbone = backbone
         self.head = head
-    
-    def forward(self, z1, x1):
-        z = self.backbone(z1)
-        x = self.backbone(x1)
+
+    def forward(self, z1, x1, z2, x2):
+        z = self.backbone(z1, z2)
+        x = self.backbone(x1, x2)
         return self.head(z, x)
 
 
 class TrackerSiamFC(Tracker):
 
-    def __init__(self, net_path=None, **kwargs):
-        super(TrackerSiamFC, self).__init__('SiamFC', True)
+    def __init__(self, net_path=None, name='SiamFC', **kwargs):
+        super(TrackerSiamFC, self).__init__(name, True)
         self.cfg = self.parse_args(**kwargs)
 
         # setup GPU device if available
@@ -50,10 +50,10 @@ class TrackerSiamFC(Tracker):
 
         # setup model
         self.net = Net(
-            backbone=SiameseNetRGB(),
+            backbone=SSMA(3,1),
             head=SiamFC(self.cfg.out_scale))
         ops.init_weights(self.net)
-        
+
         # load checkpoint if provided
         if net_path is not None:
             self.net.load_state_dict(torch.load(
@@ -69,7 +69,7 @@ class TrackerSiamFC(Tracker):
             lr=self.cfg.initial_lr,
             weight_decay=self.cfg.weight_decay,
             momentum=self.cfg.momentum)
-        
+
         # setup lr scheduler
         gamma = np.power(
             self.cfg.ultimate_lr / self.cfg.initial_lr,
@@ -103,12 +103,12 @@ class TrackerSiamFC(Tracker):
             'momentum': 0.9,
             'r_pos': 16,
             'r_neg': 0}
-        
+
         for key, val in kwargs.items():
             if key in cfg:
                 cfg.update({key: val})
         return namedtuple('Config', cfg.keys())(**cfg)
-    
+
     @torch.no_grad()
     def init(self, visible_img, infrared_img, box):
         # set to evaluation mode
@@ -138,7 +138,7 @@ class TrackerSiamFC(Tracker):
         self.z_sz = np.sqrt(np.prod(self.target_sz + context))
         self.x_sz = self.z_sz * \
             self.cfg.instance_sz / self.cfg.exemplar_sz
-        
+
         # exemplar visible image
         self.avg_color = np.mean(visible_img, axis=(0, 1))
         z1 = ops.crop_and_resize(
@@ -158,8 +158,8 @@ class TrackerSiamFC(Tracker):
             self.device).permute(2, 0, 1).unsqueeze(0).float()
         z2 = torch.from_numpy(z2).unsqueeze(2).to(
             self.device).permute(2, 0, 1).unsqueeze(0).float()
-        self.kernel = self.net.backbone(z1)
-    
+        self.kernel = self.net.backbone(z1, z2)
+
     @torch.no_grad()
     def update(self, visible_img, infrared_img):
         # set to evaluation mode
@@ -182,9 +182,9 @@ class TrackerSiamFC(Tracker):
         x2 = np.stack(x2, axis=0)
         x2 = torch.from_numpy(x2).unsqueeze(3).to(
             self.device).permute(0, 3, 1, 2).float()
-        
+
         # responses
-        x = self.net.backbone(x1)
+        x = self.net.backbone(x1, x2)
         responses = self.net.head(self.kernel, x)
         responses = responses.squeeze(1).cpu().numpy()
 
@@ -229,7 +229,7 @@ class TrackerSiamFC(Tracker):
             self.target_sz[1], self.target_sz[0]])
 
         return box
-    
+
     def track(self, visible_files, infrared_files, box, visualize=False):
         frame_num = len(visible_files)
         boxes = np.zeros((frame_num, 4))
@@ -251,7 +251,7 @@ class TrackerSiamFC(Tracker):
                 ops.show_image(visible_img, boxes[f, :])
 
         return boxes, times
-    
+
     def train_step(self, batch, backward=True):
         # set network mode
         self.net.train(backward)
@@ -265,23 +265,23 @@ class TrackerSiamFC(Tracker):
 
         with torch.set_grad_enabled(backward):
             # inference
-            responses = self.net(z1, x1)
+            responses = self.net(z1, x1, z2, x2)
 
             # calculate loss
             labels = self._create_labels(responses.size())
             loss = self.criterion(responses, labels)
-            
+
             if backward:
                 # back propagation
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-        
+
         return loss.item()
 
     @torch.enable_grad()
-    def train_over(self, seqs1, seqs2, val_seqs=None,
-                   save_dir='pretrained'):
+    def train_over(self, seqs1, seqs2, seq_v1, seq_v2,
+                   val_seqs=None, save_dir='pretrained'):
         # set to train mode
         self.net.train()
 
@@ -298,7 +298,13 @@ class TrackerSiamFC(Tracker):
             seqs_rgb=seqs1,
             seqs_i=seqs2,
             transforms=transforms)
-        
+
+        # setup validation setup
+        dataset_v = Pair(
+            seqs_rgb=seqs_v1,
+            seqs_i=seqs_v2,
+            transforms=transforms)
+
         # setup dataloader
         dataloader = DataLoader(
             dataset,
@@ -307,11 +313,23 @@ class TrackerSiamFC(Tracker):
             num_workers=self.cfg.num_workers,
             pin_memory=self.cuda,
             drop_last=True)
-        
+
+        #setup validation dataloader
+        dataloader_v = DataLoader(
+            dataset_v,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cuda,
+            drop_last=True)
+
         # loop over epochs
         for epoch in range(self.cfg.epoch_num):
             # update lr at each epoch
             self.lr_scheduler.step(epoch=epoch)
+
+            #set net to train mode
+            self.net.train()
 
             # loop over dataloader
             for it, batch in enumerate(dataloader):
@@ -319,14 +337,23 @@ class TrackerSiamFC(Tracker):
                 print('Epoch: {} [{}/{}] Loss: {:.5f}'.format(
                     epoch + 1, it + 1, len(dataloader), loss))
                 sys.stdout.flush()
-            
+
+            # set net to evaluation mode
+            self.net.eval()
+
+            for it, batch in enumerate(dataloader_v):
+                loss = self.train_step(batch, backward=True)
+                print('Validation: Epoch: {} [{}/{}] Loss: {:.5f}'.format(
+                    epoch + 1, it + 1, len(dataloader_v), loss))
+                sys.stdout.flush()
+
             # save checkpoint
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
             net_path = os.path.join(
-                save_dir, 'siamfc_alexnet_RGB_Dropout_e%d.pth' % (epoch + 1))
+                save_dir, 'siamfc_alexnet_SSMA_new_e%d.pth' % (epoch + 1))
             torch.save(self.net.state_dict(), net_path)
-    
+
     def _create_labels(self, size):
         # skip if same sized labels already created
         if hasattr(self, 'labels') and self.labels.size() == size:
@@ -359,5 +386,5 @@ class TrackerSiamFC(Tracker):
 
         # convert to tensors
         self.labels = torch.from_numpy(labels).to(self.device).float()
-        
+
         return self.labels
